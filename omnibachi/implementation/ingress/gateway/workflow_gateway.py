@@ -313,7 +313,16 @@ def execute_workflow(
     # ── STEP 3: Egress — flush trace as value post-execution ──
     # Per CONSTITUTION_TRACE_EXECUTION_V0 §7: egress owns all trace I/O
     trace_events = trace_emitter.get_events()
-    trace_path = trace_root / execution_id / f"{execution_id}.jsonl"
+
+    # Route traces into domain/subdomain directories for human-inspectable organization.
+    # Domain derived from namespace; subdomain from frontmatter (declared in WF source).
+    trace_domain = namespace
+    trace_subdomain = wf_artifact.get("frontmatter", {}).get("subdomain", "")
+    if trace_subdomain:
+        trace_path = trace_root / trace_domain / trace_subdomain / execution_id / f"{execution_id}.jsonl"
+    else:
+        trace_path = trace_root / trace_domain / execution_id / f"{execution_id}.jsonl"
+
     TraceEgressAdapter().flush(trace_events, trace_path)
 
     # Render DAG + trace overlay PNG — requires wf_artifact, called here
