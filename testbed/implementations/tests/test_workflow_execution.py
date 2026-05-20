@@ -172,8 +172,8 @@ class TestWorkflowExecution(RuntimeTestCase):
 
         self.assertEqual(result.status, "SUCCESS")
 
-        # Verify trace file exists at expected path
-        trace_dir = self.trace_root / result.trace_id
+        # Verify trace file exists at expected path (domain-routed)
+        trace_dir = self.trace_root / "TEST" / result.trace_id
         trace_file = trace_dir / f"{result.trace_id}.jsonl"
 
         self.assertTrue(trace_file.exists(), f"Trace file not found: {trace_file}")
