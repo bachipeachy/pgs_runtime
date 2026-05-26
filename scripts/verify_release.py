@@ -1,5 +1,5 @@
 """
-verify_omnibachi_release_readiness.py — Pre-release gate for omnibachi
+verify_release.py — Pre-release gate for pgs_runtime (v0.3.0+)
 
 SELF-CONTAINED:
 - builds snapshot via pgs_build.py
@@ -16,7 +16,7 @@ import tempfile
 from pathlib import Path
 
 RUNTIME_ROOT = Path(__file__).resolve().parent.parent
-OMNIBACHI_DIR = RUNTIME_ROOT / "omnibachi"
+PKG_DIR = RUNTIME_ROOT / "pgs_runtime"
 
 PGS_COMPILER_ROOT = RUNTIME_ROOT.parent / "pgs_compiler"
 PGS_BUILD_SCRIPT = PGS_COMPILER_ROOT / "scripts" / "pgs_build.py"
@@ -35,6 +35,8 @@ _IMPORTLIB_APPROVED_FILES = {
     "runtime_loader.py",
     "ct_executor.py",
     "execute_ct.py",
+    "loader.py",
+    "dispatcher.py",  # CS handler instantiation via handler_ref["module"]
 }
 
 _PASS = []
@@ -51,7 +53,7 @@ def _run(cmd: str) -> str:
 
 def _grep(pattern: str, flags: str = ""):
     result = subprocess.run(
-        f'grep -rn {flags} --include="*.py" "{pattern}" "{OMNIBACHI_DIR}"',
+        f'grep -rn {flags} --include="*.py" "{pattern}" "{PKG_DIR}"',
         shell=True,
         capture_output=True,
         text=True,
@@ -80,7 +82,11 @@ def _check(name: str, fn):
 # ── Static Checks ────────────────────────────────────────────────────────
 
 def check_import():
-    _run('python -c "import omnibachi"')
+    _run('python -c "import pgs_runtime"')
+
+
+def check_no_omnibachi_import():
+    _assert_no_hits(r"(from|import) omnibachi", "-E")
 
 
 def check_no_pgs_protocol_import():
@@ -131,7 +137,7 @@ def check_pyproject_toml():
 # ── Execution Setup ─────────────────────────────────────────────────────
 
 _WF = "blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0"
-_CLI = "python -m omnibachi.implementation.ingress.cli.cli_adapter run"
+_CLI = "python -m pgs_runtime.cli run"
 
 
 def _prepare_workspace():
@@ -210,11 +216,12 @@ def check_trace_schema():
 # ── Main ───────────────────────────────────────────────────────────────
 
 def main():
-    print("\n=== Omnibachi Release Verification ===")
+    print("\n=== PGS Runtime Release Verification ===")
     print(f"  runtime root : {RUNTIME_ROOT}")
 
     print("\n-- Static Checks --")
     _check("Package imports cleanly", check_import)
+    _check("No omnibachi.* imports", check_no_omnibachi_import)
     _check("No pgs_protocol.* imports", check_no_pgs_protocol_import)
     _check("No pgs_compiler.* imports", check_no_pgs_compiler_import)
     _check("No structure.* imports", check_no_structure_import)

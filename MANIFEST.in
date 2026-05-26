@@ -4,6 +4,5 @@ exclude *.sh
 
 prune scripts
 prune testbed
-prune pgs_*
 
 global-exclude __pycache__ *.pyc

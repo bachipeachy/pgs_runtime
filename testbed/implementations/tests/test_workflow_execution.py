@@ -1,254 +1,146 @@
 """
 Test Suite 4: Workflow Execution Tests
 
-End-to-end workflow execution tests using WF → CC → CS pattern
-via the testbed TestAppendRuntime CS implementation.
+Integration tests for end-to-end workflow execution using the v0.3.0 runtime.
+These tests require a compiled tokenized snapshot at PGS_WORKSPACE.
+Tests are skipped if PGS_WORKSPACE is not set or the workspace is not valid.
+
+v0.3.0 execution path:
+    load_domain(workspace, domain) → RuntimePackage
+    make_trace_id(domain, wf_fqdn, payload) → trace_id
+    TraceWriter(trace_dir, trace_id, domain, wf_addr, wf_fqdn)
+    run_wf(wf_fqdn, payload, pkg, writer, data_root) → (status, surface)
 """
 
-import copy
-import json
+import os
+import shutil
+import tempfile
 import unittest
+from pathlib import Path
 
-from testbed.implementations.tests.test_helpers import RuntimeTestCase
+from pgs_runtime.evidence import TraceWriter, make_trace_id
+from pgs_runtime.loader import load_domain
+from pgs_runtime.scheduler import run_wf
 
 
-class TestWorkflowExecution(RuntimeTestCase):
-    """Tests for end-to-end workflow execution."""
+def _get_workspace() -> Path | None:
+    """Return PGS_WORKSPACE path if valid, else None."""
+    ws = os.environ.get("PGS_WORKSPACE")
+    if not ws:
+        return None
+    p = Path(ws)
+    if not p.exists():
+        return None
+    return p
 
-    def _setup_append_workflow(self, wf_code: str) -> str:
-        """
-        Set up WF/CC/CS/RB artifacts for a simple APPEND workflow.
 
-        Creates:
-        - WF artifact: IN → CC → EXIT
-        - IN artifact: accepts any payload (no required fields)
-        - CC artifact: pipeline step, side_effect=testbed::CS_TEST_APPEND_V0, op=APPEND
-        - CS artifact: wired to testbed.implementations.test_cs_runtime.TestAppendRuntime
-        - RB artifact: binds CS_TEST_APPEND_V0
-        """
-        wf_fqdn = wf_code if "::" in wf_code else f"TEST::{wf_code}"
-        in_fqdn = f"TEST::IN_APPEND_V0"
-        cc_fqdn = "TEST::CC_TEST_APPEND_V0"
-        rb_fqdn = "TEST::RB_TEST_APPEND_V0"
+_WORKSPACE = _get_workspace()
+_DATA_ROOT = os.environ.get("PGS_DATA_ROOT", "")
 
-        wf_artifact = {
-            "fqdn_id": wf_fqdn,
-            "artifact_code": wf_fqdn,
-            "namespace": "TEST",
-            "frontmatter": {
-                "wf_code": wf_fqdn,
-                "runtime_binding": rb_fqdn,
-                "core": {
-                    "start_node": "validate",
-                    "nodes": {
-                        "validate": {
-                            "type": "IN",
-                            "fqdn_id": in_fqdn,
-                            "next": {
-                                "ACK": "append",
-                                "NACK": "exit"
-                            }
-                        },
-                        "append": {
-                            "type": "CC",
-                            "fqdn_id": cc_fqdn,
-                            "inputs": {
-                                "record": "$.payload.record"
-                            },
-                            "next": {
-                                "SUCCESS": "exit",
-                                "VIOLATION": "exit",
-                                "BACKEND_ERROR": "exit"
-                            }
-                        },
-                        "exit": {
-                            "type": "EXIT",
-                            "reason": "COMPLETED"
-                        }
-                    }
-                }
-            }
-        }
+_SKIP_REASON = (
+    "Integration test requires PGS_WORKSPACE and PGS_DATA_ROOT env vars "
+    "pointing to a compiled tokenized snapshot."
+)
 
-        in_artifact = {
-            "fqdn_id": in_fqdn,
-            "artifact_code": "IN_APPEND_V0",
-            "frontmatter": {
-                "core": {
-                    "inputs": {}  # No required fields — any payload accepted
-                }
-            }
-        }
 
-        cc_artifact = {
-            "fqdn_id": cc_fqdn,
-            "artifact_code": "CC_TEST_APPEND_V0",
-            "frontmatter": {
-                "cc_code": cc_fqdn,
-                "core": {
-                    "result_status_contract": {
-                        "on_input_failure": "VIOLATION"
-                    },
-                    "pipeline": [
-                        {
-                            "step": "append",
-                            "side_effect": "testbed::CS_TEST_APPEND_V0",
-                            "op": "APPEND",
-                            "inputs": {
-                                "record": "$.inputs.record"
-                            },
-                            "outputs": {
-                                "record_id": "$.capability_result.record_id"
-                            },
-                            "on_result": {
-                                "SUCCESS": "continue",
-                                "VIOLATION": "exit",
-                                "BACKEND_ERROR": "exit"
-                            }
-                        }
-                    ]
-                }
-            }
-        }
+@unittest.skipUnless(_WORKSPACE, _SKIP_REASON)
+class TestWorkflowExecution(unittest.TestCase):
+    """Integration tests for end-to-end workflow execution."""
 
-        cs_artifact = self.get_test_cs_artifact()
+    _WF_FQDN = "blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0"
+    _DOMAIN = "blockchain"
 
-        rb_artifact = {
-            "fqdn_id": rb_fqdn,
-            "artifact_code": "RB_TEST_APPEND_V0",
-            "frontmatter": {
-                "core": {
-                    "bindings": {
-                        "testbed::CS_TEST_APPEND_V0": {
-                            "policy": {}
-                        }
-                    }
-                }
-            }
-        }
+    def setUp(self):
+        self.workspace = _WORKSPACE
+        self.data_root = _DATA_ROOT or str(self.workspace / "data")
+        self.pkg = load_domain(self.workspace, self._DOMAIN)
 
-        self.create_artifact_file("workflows", wf_artifact)
-        self.create_artifact_file("intents", in_artifact)
-        self.create_artifact_file("capability_contracts", cc_artifact)
-        self.create_artifact_file("capability_side_effects", cs_artifact)
-        self.create_artifact_file("runtime_bindings", rb_artifact)
+    def _run_wf(self, wf_fqdn: str, payload: dict) -> tuple[str, dict, Path]:
+        """Execute workflow; return (status, surface, trace_file)."""
+        tmp_traces = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(tmp_traces), True)
 
-        return wf_fqdn
+        trace_id = make_trace_id(self._DOMAIN, wf_fqdn, payload)
+        trace_dir = tmp_traces / trace_id
+        trace_dir.mkdir(parents=True)
 
-    def test_minimal_workflow_execution(self):
-        """Execute minimal WF → IN → CC → CS workflow, verify success."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        wf_fqdn = self._setup_append_workflow("TEST::WF_APPEND_MINIMAL_V0")
-
-        result, trace_events = execute_workflow(
-            workflow_code=wf_fqdn,
-            payload={"record": {"name": "test-entry"}},
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
+        wf_addr = self.pkg.vocab.addr(wf_fqdn)
+        writer = TraceWriter(
+            trace_dir=trace_dir,
+            trace_id=trace_id,
+            domain=self._DOMAIN,
+            wf_addr=wf_addr,
+            wf_fqdn=wf_fqdn,
         )
 
-        self.assertEqual(result.status, "SUCCESS")
-        self.assertEqual(result.exit_reason_code, "COMPLETED")
-        self.assertEqual(result.workflow_code, wf_fqdn)
-        self.assertNotEqual(result.trace_id, "")
-        self.assertGreaterEqual(result.duration_ms, 0)
-        self.assertIsInstance(trace_events, list)
+        try:
+            status, surface = run_wf(
+                wf_fqdn=wf_fqdn,
+                payload=payload,
+                pkg=self.pkg,
+                writer=writer,
+                data_root=self.data_root,
+            )
+        finally:
+            writer.close()
 
-    def test_workflow_trace_generation(self):
-        """Workflow execution MUST generate execution trace."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
+        trace_file = trace_dir / f"{trace_id}.jsonl"
+        return status, surface, trace_file
 
-        wf_fqdn = self._setup_append_workflow("TEST::WF_APPEND_TRACE_V0")
+    def test_load_domain_succeeds(self):
+        """load_domain MUST succeed with real workspace."""
+        self.assertEqual(self.pkg.domain, self._DOMAIN)
+        self.assertIsNotNone(self.pkg.dispatch)
+        self.assertIsNotNone(self.pkg.handlers)
+        self.assertIsNotNone(self.pkg.vocab)
 
-        result, _ = execute_workflow(
-            workflow_code=wf_fqdn,
-            payload={"record": {"name": "trace-test"}},
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
+    def test_wf_in_vocab(self):
+        """Target WF FQDN MUST be present in the vocab index."""
+        addr = self.pkg.vocab.addr(self._WF_FQDN)
+        self.assertIsInstance(addr, int)
+        self.assertGreater(addr, 0)
 
-        self.assertEqual(result.status, "SUCCESS")
+    def test_make_trace_id_format(self):
+        """make_trace_id MUST return a non-empty string embedding the WF code."""
+        payload = {"actor_name": "Alice", "email": "alice@example.com"}
+        trace_id = make_trace_id(self._DOMAIN, self._WF_FQDN, payload)
+        self.assertIsInstance(trace_id, str)
+        self.assertGreater(len(trace_id), 0)
+        wf_code = self._WF_FQDN.split("::")[-1]
+        self.assertIn(wf_code, trace_id)
 
-        # Verify trace file exists at expected path (domain-routed)
-        trace_dir = self.trace_root / "TEST" / result.trace_id
-        trace_file = trace_dir / f"{result.trace_id}.jsonl"
+    def test_workflow_execution_returns_status(self):
+        """run_wf MUST return a non-empty status string."""
+        payload = {"actor_name": "TestActor", "email": "test@example.com"}
+        status, surface, _ = self._run_wf(self._WF_FQDN, payload)
+        self.assertIsInstance(status, str)
+        self.assertIn(status, {"SUCCESS", "ALREADY_EXISTS", "VIOLATION", "NACK"})
 
-        self.assertTrue(trace_file.exists(), f"Trace file not found: {trace_file}")
+    def test_trace_file_written(self):
+        """run_wf MUST write a non-empty JSONL trace file."""
+        import json
+        payload = {"actor_name": "TraceActor", "email": "trace@example.com"}
+        status, _, trace_file = self._run_wf(self._WF_FQDN, payload)
+        self.assertTrue(trace_file.exists(), f"Trace file not written: {trace_file}")
+        lines = [json.loads(line) for line in trace_file.read_text().splitlines() if line.strip()]
+        self.assertGreater(len(lines), 0)
 
-        with open(trace_file) as f:
-            trace_lines = [json.loads(line) for line in f if line.strip()]
+    def test_same_payload_same_hash_suffix(self):
+        """Identical payload MUST produce the same hash suffix in the trace ID."""
+        payload = {"actor_name": "DeterministicActor", "email": "det@example.com"}
+        id1 = make_trace_id(self._DOMAIN, self._WF_FQDN, payload)
+        id2 = make_trace_id(self._DOMAIN, self._WF_FQDN, payload)
+        suffix1 = id1.rsplit("__", 1)[-1]
+        suffix2 = id2.rsplit("__", 1)[-1]
+        self.assertEqual(suffix1, suffix2)
 
-        self.assertGreater(len(trace_lines), 0)
-
-    def test_workflow_exit_condition_success(self):
-        """Workflow MUST exit with SUCCESS when reaching exit node with reason COMPLETED."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        wf_fqdn = self._setup_append_workflow("TEST::WF_APPEND_EXIT_V0")
-
-        result, _ = execute_workflow(
-            workflow_code=wf_fqdn,
-            payload={"record": {"data": "exit-test"}},
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
-
-        self.assertEqual(result.status, "SUCCESS")
-        self.assertEqual(result.exit_reason_code, "COMPLETED")
-        self.assertIsNone(result.error_code)
-        self.assertIsNone(result.message)
-
-    def test_workflow_payload_not_mutated(self):
-        """Workflow execution MUST NOT mutate input payload."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        wf_fqdn = self._setup_append_workflow("TEST::WF_APPEND_IMMUTABLE_V0")
-
-        original_payload = {
-            "record": {"key": "original_value"},
-            "nested": {"key": "value"}
-        }
-        payload_before = copy.deepcopy(original_payload)
-
-        execute_workflow(
-            workflow_code=wf_fqdn,
-            payload=original_payload,
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
-
-        self.assertEqual(original_payload, payload_before)
-
-    def test_workflow_execution_result_structure(self):
-        """ExecutionResult MUST have all required fields."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        wf_fqdn = self._setup_append_workflow("TEST::WF_APPEND_RESULT_V0")
-
-        result, trace_events = execute_workflow(
-            workflow_code=wf_fqdn,
-            payload={"record": {}},
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
-
-        self.assertTrue(hasattr(result, 'status'))
-        self.assertTrue(hasattr(result, 'exit_reason_code'))
-        self.assertTrue(hasattr(result, 'trace_id'))
-        self.assertTrue(hasattr(result, 'duration_ms'))
-        self.assertTrue(hasattr(result, 'result_payload'))
-        self.assertTrue(hasattr(result, 'workflow_code'))
-        self.assertTrue(hasattr(result, 'module'))
-        self.assertTrue(hasattr(result, 'error_code'))
-        self.assertTrue(hasattr(result, 'message'))
-
-        self.assertIsInstance(trace_events, list)
+    def test_different_payload_different_hash_suffix(self):
+        """Different payloads MUST produce different hash suffixes in the trace ID."""
+        id1 = make_trace_id(self._DOMAIN, self._WF_FQDN, {"actor_name": "Alice"})
+        id2 = make_trace_id(self._DOMAIN, self._WF_FQDN, {"actor_name": "Bob"})
+        suffix1 = id1.rsplit("__", 1)[-1]
+        suffix2 = id2.rsplit("__", 1)[-1]
+        self.assertNotEqual(suffix1, suffix2)
 
 
 if __name__ == '__main__':

@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "omnibachi"
-version = "0.2.0"
-description = "OmniBachi runtime for Protocol-Governed Systems (PGS)"
+name = "pgs_runtime"
+version = "0.3.1"
+description = "PGS runtime for Protocol-Governed Systems"
 readme = "README.md"
 requires-python = ">=3.10"
 
@@ -34,12 +34,12 @@ Homepage = "https://github.com/bachipeachy/pgs_runtime"
 Repository = "https://github.com/bachipeachy/pgs_runtime"
 
 [project.scripts]
-omnibachi = "omnibachi.cli:main"
+pgs_runtime = "pgs_runtime.cli:main"
 
 [tool.setuptools]
 include-package-data = false
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["omnibachi*"]
-exclude = ["testbed*", "scripts*", "pgs_*", "*.tests"]
+include = ["pgs_runtime*"]
+exclude = ["testbed*", "scripts*", "*.tests"]

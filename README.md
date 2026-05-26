@@ -58,13 +58,13 @@ data/
 ## CLI surface
 
 ```bash
-omnibachi run \
+pgs_runtime run \
   --wf blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0 \
   --payload payload.json \
-  --data-root ./data \
-  --workspace .
+  --data-root /abs/path/to/pgs_workspace/data \
+  --workspace /abs/path/to/pgs_workspace
 
-omnibachi examine ./traces/<TRACE_ID>/<TRACE_ID>.jsonl
+pgs_runtime examine ./traces/<TRACE_ID>/<TRACE_ID>.jsonl
 ```
 
 That is the entire public interface. Everything else is governed by the protocol snapshot.
@@ -83,7 +83,7 @@ You run a workflow. The runtime:
 
 No logic exists in the runtime for any specific workflow.
 
-**Example:** `omnibachi run --wf blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0 ...`
+**Example:** `pgs_runtime run --wf blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0 ...`
 
 The runtime has no knowledge of blockchain. It only traverses the precomputed graph compiled from that workflow's protocol declaration.
 

@@ -2,120 +2,169 @@
 Test Suite 3: Failure Mode Tests
 
 Tests that runtime fails fast and explicitly on errors.
+v0.3.0: failure modes are surfaced via load_domain (FileNotFoundError,
+RuntimeError), ct_executor (CTExecutionError), and dispatcher internals.
 """
 
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from testbed.implementations.tests.test_helpers import RuntimeTestCase
-from omnibachi.implementation.execution.host import RuntimeBindingError, RuntimeLoader
+from pgs_runtime.loader import load_domain
+from pgs_runtime.ct_executor import CTExecutor, CTExecutionError
 
 
-class TestFailureModes(RuntimeTestCase):
+def _failing_atom(inputs: dict) -> dict:
+    raise ValueError("simulated failure")
+
+
+def _write_snapshot(workspace: Path, domain: str, projection_hash: str = "abc123") -> None:
+    """Write a minimal valid snapshot to workspace/tokenized_snapshot/<domain>."""
+    tok_dir = workspace / "tokenized_snapshot" / domain
+    trust_dir = workspace / "trust_snapshot" / domain
+    vocab_dir = workspace / "vocabulary_snapshot" / domain
+    tok_dir.mkdir(parents=True)
+    trust_dir.mkdir(parents=True)
+    vocab_dir.mkdir(parents=True)
+
+    (tok_dir / "dispatch.json").write_text(
+        json.dumps({"routing": {}, "pipeline": {}, "entry": {}, "bindings": {}})
+    )
+    (tok_dir / "handlers.json").write_text(
+        json.dumps({"ct": {}, "cs": {}, "rb_policy": {}})
+    )
+    (tok_dir / "metadata.json").write_text(
+        json.dumps({"projection_hash": projection_hash})
+    )
+    (trust_dir / "structure_attestation.json").write_text(
+        json.dumps({"tokenized_projection_hash": projection_hash})
+    )
+    (vocab_dir / "forward.json").write_text(json.dumps({}))
+    (vocab_dir / "reverse.json").write_text(json.dumps({}))
+
+
+class TestFailureModes(unittest.TestCase):
     """Tests for error handling and fail-fast behavior."""
 
-    def test_fail_on_missing_snapshot(self):
-        """MUST fail immediately if snapshot_root doesn't exist."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
+    # ── load_domain failure modes ─────────────────────────────────────────
 
-        non_existent = Path("/tmp/does_not_exist_snapshot")
+    def test_fail_on_missing_workspace(self):
+        """load_domain MUST raise FileNotFoundError if workspace doesn't exist."""
+        with self.assertRaises(FileNotFoundError):
+            load_domain("/tmp/no_such_pgs_workspace_xyz123", "blockchain")
 
-        result, _ = execute_workflow(
-            workflow_code="WF_ANY_V0",
-            payload={},
-            snapshot_root=non_existent,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
+    def test_fail_on_missing_dispatch_json(self):
+        """load_domain MUST raise FileNotFoundError if dispatch.json is absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            domain = "testdomain"
+            tok_dir = workspace / "tokenized_snapshot" / domain
+            tok_dir.mkdir(parents=True)
+            # No dispatch.json written
+            with self.assertRaises(FileNotFoundError):
+                load_domain(workspace, domain)
 
-        self.assertEqual(result.status, "FAILED")
-        self.assertEqual(result.exit_reason_code, "SNAPSHOT_NOT_FOUND")
-        self.assertEqual(result.error_code, "SNAPSHOT_NOT_FOUND")
+    def test_fail_on_missing_handlers_json(self):
+        """load_domain MUST raise FileNotFoundError if handlers.json is absent."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            domain = "testdomain"
+            tok_dir = workspace / "tokenized_snapshot" / domain
+            tok_dir.mkdir(parents=True)
+            (tok_dir / "dispatch.json").write_text(
+                json.dumps({"routing": {}, "pipeline": {}, "entry": {}, "bindings": {}})
+            )
+            # No handlers.json written
+            with self.assertRaises(FileNotFoundError):
+                load_domain(workspace, domain)
 
-    def test_fail_on_missing_workflow_artifact(self):
-        """MUST fail immediately if workflow artifact not in snapshot."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
+    def test_fail_on_hash_mismatch(self):
+        """load_domain MUST raise RuntimeError on projection_hash mismatch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            domain = "testdomain"
+            _write_snapshot(workspace, domain, projection_hash="correct_hash")
 
-        result, _ = execute_workflow(
-            workflow_code="WF_DOES_NOT_EXIST_V0",
-            payload={},
-            runtime_binding="RB_ANY_V0",
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
+            # Tamper: overwrite attestation with wrong hash
+            trust_dir = workspace / "trust_snapshot" / domain
+            (trust_dir / "structure_attestation.json").write_text(
+                json.dumps({"tokenized_projection_hash": "wrong_hash"})
+            )
 
-        self.assertEqual(result.status, "FAILED")
-        self.assertEqual(result.exit_reason_code, "WORKFLOW_NOT_FOUND")
+            with self.assertRaises(RuntimeError) as ctx:
+                load_domain(workspace, domain)
+            self.assertIn("integrity", str(ctx.exception).lower())
 
-    def test_fail_on_unknown_cs_capability(self):
-        """MUST fail immediately if CS artifact not found in snapshot."""
-        rb_artifact = {
-            "frontmatter": {
-                "core": {
-                    "bindings": {
-                        "capability_side_effects::CS_UNKNOWN_RUNTIME_V0": {
-                            "policy": {}
-                        }
-                    }
+    def test_fail_on_empty_projection_hash(self):
+        """load_domain MUST raise RuntimeError if projection_hash is empty string."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            domain = "testdomain"
+            _write_snapshot(workspace, domain, projection_hash="")
+
+            with self.assertRaises(RuntimeError):
+                load_domain(workspace, domain)
+
+    # ── CT executor failure modes ─────────────────────────────────────────
+
+    def test_ct_executor_fails_on_missing_atom_stream(self):
+        """CTExecutor MUST raise CTExecutionError if atom_stream is absent."""
+        executor = CTExecutor()
+        with self.assertRaises(CTExecutionError):
+            executor.execute(ct_ir={}, inputs={})
+
+    def test_ct_executor_fails_on_missing_handler_ref(self):
+        """CTExecutor MUST raise CTExecutionError if handler_ref is absent."""
+        ct_ir = {
+            "atom_stream": [
+                {
+                    "atom": "test::CT_NO_HANDLER_V0",
+                    "args": {},
+                    "out": "result",
+                    # No handler_ref
                 }
-            }
+            ]
         }
+        executor = CTExecutor()
+        with self.assertRaises(CTExecutionError):
+            executor.execute(ct_ir=ct_ir, inputs={})
 
-        rb_path = self.temp_path / "rb_unknown.json"
-        with open(rb_path, 'w') as f:
-            json.dump(rb_artifact, f)
+    def test_ct_executor_fails_when_atom_raises(self):
+        """CTExecutor MUST raise CTExecutionError if the atom function raises."""
+        _THIS_MODULE = "testbed.implementations.tests.test_failure_modes"
 
-        loader = RuntimeLoader(
-            rb_path=rb_path,
-            snapshot_root=self.snapshot_root,
-            module_data_root=str(self.module_data_root),
-        )
-
-        with self.assertRaisesRegex(RuntimeBindingError, "CS artifact not found"):
-            loader.load()
-
-    def test_fail_on_malformed_rb_artifact(self):
-        """MUST fail immediately if RB artifact has invalid structure (no frontmatter.core)."""
-        rb_artifact = {
-            "fqdn_id": "TEST::RB_INVALID_V0",
-            # "frontmatter": {}  # MISSING
-        }
-
-        rb_path = self.temp_path / "rb_invalid.json"
-        with open(rb_path, 'w') as f:
-            json.dump(rb_artifact, f)
-
-        loader = RuntimeLoader(
-            rb_path=rb_path,
-            module_data_root=str(self.module_data_root),
-        )
-
-        with self.assertRaisesRegex(RuntimeBindingError, "missing frontmatter"):
-            loader.load()
-
-    def test_fail_on_empty_rb_bindings(self):
-        """MUST fail if RB artifact has no bindings."""
-        rb_artifact = {
-            "frontmatter": {
-                "core": {
-                    "bindings": {}  # Empty bindings
+        ct_ir = {
+            "atom_stream": [
+                {
+                    "atom": "test::CT_FAIL_V0",
+                    "handler_ref": {
+                        "module": _THIS_MODULE,
+                        "callable": "_failing_atom",
+                    },
+                    "args": {},
+                    "out": "result",
                 }
-            }
+            ]
         }
+        executor = CTExecutor()
+        with self.assertRaises(CTExecutionError):
+            executor.execute(ct_ir=ct_ir, inputs={})
 
-        rb_path = self.temp_path / "rb_empty.json"
-        with open(rb_path, 'w') as f:
-            json.dump(rb_artifact, f)
+    # ── Snapshot load success path ────────────────────────────────────────
 
-        loader = RuntimeLoader(
-            rb_path=rb_path,
-            module_data_root=str(self.module_data_root),
-        )
+    def test_valid_minimal_snapshot_loads(self):
+        """load_domain MUST succeed with a minimal but structurally valid snapshot."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            domain = "testdomain"
+            _write_snapshot(workspace, domain, projection_hash="deadbeef")
 
-        with self.assertRaisesRegex(RuntimeBindingError, "no bindings"):
-            loader.load()
+            pkg = load_domain(workspace, domain)
+            self.assertEqual(pkg.domain, domain)
+            self.assertIsNotNone(pkg.dispatch)
+            self.assertIsNotNone(pkg.handlers)
+            self.assertIsNotNone(pkg.vocab)
 
 
 if __name__ == '__main__':

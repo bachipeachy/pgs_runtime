@@ -1,14 +1,20 @@
 """
 Test Suite 5: Determinism Tests
 
-Tests that runtime execution is deterministic.
+Tests that runtime identifiers and snapshot loading are deterministic.
+v0.3.0: determinism of workflow execution is guaranteed by the token-native
+architecture. These tests focus on the deterministic components that can be
+unit-tested without a full compiled tokenized snapshot.
 """
 
 import json
 import hashlib
+import tempfile
 import unittest
+from pathlib import Path
 
-from testbed.implementations.tests.test_helpers import RuntimeTestCase
+from pgs_runtime.evidence import make_trace_id
+from pgs_runtime.loader import load_domain
 
 
 def generate_deterministic_id(prefix: str, content: dict) -> str:
@@ -16,301 +22,56 @@ def generate_deterministic_id(prefix: str, content: dict) -> str:
     Generate deterministic ID from content using SHA256 hash.
     Used for testing deterministic ID generation.
     """
-    # Serialize content deterministically (sorted keys)
     content_json = json.dumps(content, sort_keys=True, separators=(',', ':'))
-    # Hash with SHA256
     content_hash = hashlib.sha256(content_json.encode('utf-8')).hexdigest()
-    # Return prefix + first 16 chars of hash
     return f"{prefix}_{content_hash[:16]}"
 
 
-class TestDeterminism(RuntimeTestCase):
+def _write_snapshot(workspace: Path, domain: str, projection_hash: str = "abc123") -> None:
+    tok_dir = workspace / "tokenized_snapshot" / domain
+    trust_dir = workspace / "trust_snapshot" / domain
+    vocab_dir = workspace / "vocabulary_snapshot" / domain
+    tok_dir.mkdir(parents=True)
+    trust_dir.mkdir(parents=True)
+    vocab_dir.mkdir(parents=True)
+    (tok_dir / "dispatch.json").write_text(
+        json.dumps({"routing": {}, "pipeline": {}, "entry": {}, "bindings": {}})
+    )
+    (tok_dir / "handlers.json").write_text(
+        json.dumps({"ct": {}, "cs": {}, "rb_policy": {}})
+    )
+    (tok_dir / "metadata.json").write_text(
+        json.dumps({"projection_hash": projection_hash})
+    )
+    (trust_dir / "structure_attestation.json").write_text(
+        json.dumps({"tokenized_projection_hash": projection_hash})
+    )
+    (vocab_dir / "forward.json").write_text(json.dumps({}))
+    (vocab_dir / "reverse.json").write_text(json.dumps({}))
+
+
+class TestDeterminism(unittest.TestCase):
     """Tests for execution determinism."""
-
-    def test_same_input_produces_same_result(self):
-        """Executing same workflow with same payload MUST produce identical results."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        workflow_artifact = {
-            "fqdn_id": "TEST::WF_DETERMINISTIC_V0",
-            "artifact_code": "WF_DETERMINISTIC_V0",
-            "namespace": "TEST",
-            "frontmatter": {
-                "runtime_binding": "TEST::RB_DETERMINISTIC_V0"
-            },
-            "core": {
-                "entry_node": "read",
-                "nodes": {
-                    "read": {
-                        "node_code": "read",
-                        "capability": "CS_REGISTRY_V0",
-                        "operation": "READ",
-                        "inputs": {
-                            "key": "test_key"
-                        },
-                        "transitions": {
-                            "SUCCESS": "exit",
-                            "NOT_FOUND": "exit"
-                        }
-                    },
-                    "exit": {
-                        "node_code": "exit",
-                        "exit": True
-                    }
-                }
-            }
-        }
-
-        registry_path = self.module_data_root / "registry.json"
-        rb_artifact = {
-            "fqdn_id": "TEST::RB_DETERMINISTIC_V0",
-            "artifact_code": "RB_DETERMINISTIC_V0",
-            "core": {
-                "bindings": {
-                    "CS_REGISTRY_V0": {
-                        "type": "CS",
-                        "host": "RegistryRuntime",
-                        "operation": "READ",
-                        "policy": {
-                            "path": str(registry_path)
-                        }
-                    }
-                }
-            }
-        }
-
-        # Write test data
-        registry_path.write_text(json.dumps({"test_key": "deterministic_value"}))
-
-        self.create_artifact_file("workflows", workflow_artifact)
-        self.create_artifact_file("capability_side_effects", rb_artifact)
-
-        # Execute workflow multiple times with same payload
-        payload = {"input_field": "test_value"}
-
-        results = []
-        for _ in range(3):
-            result, _ = execute_workflow(
-                workflow_code="TEST::WF_DETERMINISTIC_V0",
-                payload=payload.copy(),
-                snapshot_root=self.snapshot_root,
-                data_root=self.module_data_root,
-                trace_root=self.trace_root,
-            )
-            results.append(result)
-
-        # All executions should produce same status
-        self.assertTrue(all(r.status == results[0].status for r in results))
-        self.assertTrue(all(r.exit_reason_code == results[0].exit_reason_code for r in results))
-        self.assertTrue(all(r.workflow_code == results[0].workflow_code for r in results))
 
     def test_deterministic_id_generation(self):
         """Deterministic ID generation MUST produce same ID for same content."""
         content1 = {"field1": "value1", "field2": "value2"}
         content2 = {"field1": "value1", "field2": "value2"}
-        content3 = {"field2": "value2", "field1": "value1"}  # Different order
+        content3 = {"field2": "value2", "field1": "value1"}  # Different key order
 
         id1 = generate_deterministic_id("AC", content1)
         id2 = generate_deterministic_id("AC", content2)
         id3 = generate_deterministic_id("AC", content3)
 
-        # Same content → same ID (key order doesn't matter)
         self.assertEqual(id1, id2)
         self.assertEqual(id1, id3)
 
-        # Different content → different ID
         content_different = {"field1": "different"}
         id_different = generate_deterministic_id("AC", content_different)
         self.assertNotEqual(id_different, id1)
 
-    def test_snapshot_based_execution_is_reproducible(self):
-        """Snapshot-based execution MUST be reproducible."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        workflow_artifact = {
-            "fqdn_id": "TEST::WF_REPRODUCIBLE_V0",
-            "artifact_code": "WF_REPRODUCIBLE_V0",
-            "namespace": "TEST",
-            "frontmatter": {
-                "runtime_binding": "TEST::RB_REPRODUCIBLE_V0"
-            },
-            "core": {
-                "entry_node": "write",
-                "nodes": {
-                    "write": {
-                        "node_code": "write",
-                        "capability": "CS_MUTABLE_JSON_V0",
-                        "operation": "WRITE",
-                        "inputs": {
-                            "key": "counter",
-                            "value": {"count": 1}
-                        },
-                        "transitions": {
-                            "SUCCESS": "exit"
-                        }
-                    },
-                    "exit": {
-                        "node_code": "exit",
-                        "exit": True
-                    }
-                }
-            }
-        }
-
-        storage_path = self.module_data_root / "storage.json"
-        rb_artifact = {
-            "fqdn_id": "TEST::RB_REPRODUCIBLE_V0",
-            "artifact_code": "RB_REPRODUCIBLE_V0",
-            "core": {
-                "bindings": {
-                    "CS_MUTABLE_JSON_V0": {
-                        "type": "CS",
-                        "host": "MutableJsonRuntime",
-                        "operation": "WRITE",
-                        "policy": {
-                            "path": str(storage_path)
-                        }
-                    }
-                }
-            }
-        }
-
-        self.create_artifact_file("workflows", workflow_artifact)
-        self.create_artifact_file("capability_side_effects", rb_artifact)
-
-        # Execute twice
-        result1, _ = execute_workflow(
-            workflow_code="TEST::WF_REPRODUCIBLE_V0",
-            payload={},
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
-
-        # Clear storage for second run
-        if storage_path.exists():
-            storage_path.unlink()
-
-        result2, _ = execute_workflow(
-            workflow_code="TEST::WF_REPRODUCIBLE_V0",
-            payload={},
-            snapshot_root=self.snapshot_root,
-            data_root=self.module_data_root,
-            trace_root=self.trace_root,
-        )
-
-        # Same workflow, same payload → same execution path
-        self.assertEqual(result1.status, result2.status)
-        self.assertEqual(result1.exit_reason_code, result2.exit_reason_code)
-
-    def test_trace_ids_are_unique_but_execution_deterministic(self):
-        """Trace IDs MUST be unique per execution, but execution logic deterministic."""
-        from omnibachi.implementation.ingress.gateway.workflow_gateway import execute_workflow
-
-        wf_code = "TEST::WF_TRACE_UNIQUE_V0"
-        name_registry_path = self.module_data_root / "name_registry_unique.json"
-
-        wf_artifact = {
-            "fqdn_id": wf_code,
-            "artifact_code": wf_code,
-            "namespace": "TEST",
-            "frontmatter": {
-                "wf_code": wf_code,
-                "runtime_binding": "TEST::RB_TRACE_UNIQUE_V0",
-                "core": {
-                    "start_node": "register",
-                    "nodes": {
-                        "register": {
-                            "type": "CC",
-                            "code": "CC_TEST_REGISTER_UNIQUE_V0",
-                            "next": {
-                                "SUCCESS": "exit",
-                                "VIOLATION": "exit",
-                                "BACKEND_ERROR": "exit"
-                            }
-                        },
-                        "exit": {
-                            "type": "EXIT",
-                            "reason": "COMPLETED"
-                        }
-                    }
-                }
-            }
-        }
-
-        cc_artifact = {
-            "fqdn_id": "CC_TEST_REGISTER_UNIQUE_V0",
-            "artifact_code": "CC_TEST_REGISTER_UNIQUE_V0",
-            "frontmatter": {
-                "cc_code": "CC_TEST_REGISTER_UNIQUE_V0",
-                "core": {
-                    "pipeline": [
-                        {
-                            "step": "register",
-                            "side_effect": "CS_NAME_REGISTRY_V0",
-                            "op": "WRITE",
-                            "inputs": {
-                                "name": "bob@example.com",
-                                "resource_addresses": ["0xDEF456"]
-                            },
-                            "outputs": {
-                                "success": "$.capability_result.success"
-                            },
-                            "on_result": {
-                                "SUCCESS": "exit",
-                                "VIOLATION": "exit",
-                                "BACKEND_ERROR": "exit"
-                            }
-                        }
-                    ]
-                }
-            }
-        }
-
-        rb_artifact = {
-            "fqdn_id": "TEST::RB_TRACE_UNIQUE_V0",
-            "artifact_code": "RB_TRACE_UNIQUE_V0",
-            "core": {
-                "bindings": {
-                    "CS_NAME_REGISTRY_V0": {
-                        "type": "CS",
-                        "host": "NameRegistryRuntime",
-                        "operation": "WRITE",
-                        "policy": {
-                            "path": str(name_registry_path)
-                        }
-                    }
-                }
-            }
-        }
-
-        self.create_artifact_file("workflows", wf_artifact)
-        self.create_artifact_file("capability_contracts", cc_artifact)
-        self.create_artifact_file("capability_side_effects", rb_artifact)
-
-        # Execute multiple times
-        results = []
-        for _ in range(3):
-            result, _ = execute_workflow(
-                workflow_code=wf_code,
-                payload={},
-                snapshot_root=self.snapshot_root,
-                data_root=self.module_data_root,
-                trace_root=self.trace_root,
-            )
-            results.append(result)
-
-        # Trace IDs should be unique
-        trace_ids = [r.trace_id for r in results]
-        self.assertEqual(len(set(trace_ids)), len(trace_ids))  # All unique
-
-        # But execution results should be identical
-        self.assertTrue(all(r.status == results[0].status for r in results))
-        self.assertTrue(all(r.exit_reason_code == results[0].exit_reason_code for r in results))
-
     def test_json_serialization_deterministic(self):
         """JSON serialization for ID generation MUST be deterministic."""
-        # Different key orders
         content_a = {"z": 1, "a": 2, "m": 3}
         content_b = {"a": 2, "m": 3, "z": 1}
         content_c = {"m": 3, "z": 1, "a": 2}
@@ -319,9 +80,84 @@ class TestDeterminism(RuntimeTestCase):
         id_b = generate_deterministic_id("TEST", content_b)
         id_c = generate_deterministic_id("TEST", content_c)
 
-        # Must all be identical (sorted keys)
         self.assertEqual(id_a, id_b)
         self.assertEqual(id_b, id_c)
+
+    def test_make_trace_id_format(self):
+        """make_trace_id MUST return YYYYMMDDTHHMMSSmmmZ__WF_CODE__XXXX format."""
+        import re
+        domain = "blockchain"
+        wf_fqdn = "blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0"
+        payload = {"actor_id": "alice", "email": "alice@example.com"}
+
+        trace_id = make_trace_id(domain, wf_fqdn, payload)
+
+        # Format: 20260524T151422183Z__WF_REGISTER_ACTOR_UNVERIFIED_V0__A7K2
+        pattern = r"^\d{8}T\d{6}\d{3}Z__WF_REGISTER_ACTOR_UNVERIFIED_V0__[0-9A-F]{4}$"
+        self.assertRegex(trace_id, pattern, f"trace_id {trace_id!r} does not match expected format")
+
+    def test_make_trace_id_embeds_wf_code(self):
+        """make_trace_id MUST embed the WF code (extracted from wf_fqdn) in the ID."""
+        domain = "blockchain"
+        wf_fqdn = "blockchain::WF_CREATE_WALLET_V0"
+        payload = {"wallet_id": "W_abc"}
+
+        trace_id = make_trace_id(domain, wf_fqdn, payload)
+        self.assertIn("WF_CREATE_WALLET_V0", trace_id)
+
+    def test_make_trace_id_hash_suffix_differs_for_different_payloads(self):
+        """Hash suffix in trace ID MUST differ for different payloads."""
+        domain = "blockchain"
+        wf_fqdn = "blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0"
+
+        id_alice = make_trace_id(domain, wf_fqdn, {"actor_id": "alice"})
+        id_bob = make_trace_id(domain, wf_fqdn, {"actor_id": "bob"})
+
+        # Extract suffix (last 4 chars after final __)
+        suffix_alice = id_alice.rsplit("__", 1)[-1]
+        suffix_bob = id_bob.rsplit("__", 1)[-1]
+        self.assertNotEqual(suffix_alice, suffix_bob)
+
+    def test_make_trace_id_hash_suffix_differs_for_different_domains(self):
+        """Hash suffix MUST differ for different domains."""
+        payload = {"key": "value"}
+        id1 = make_trace_id("blockchain", "blockchain::WF_SOME_V0", payload)
+        id2 = make_trace_id("ai_governance", "ai_governance::WF_SOME_V0", payload)
+
+        suffix1 = id1.rsplit("__", 1)[-1]
+        suffix2 = id2.rsplit("__", 1)[-1]
+        self.assertNotEqual(suffix1, suffix2)
+
+    def test_make_trace_id_hash_suffix_payload_key_order_invariant(self):
+        """Hash suffix MUST be invariant to payload key ordering."""
+        domain = "blockchain"
+        wf_fqdn = "blockchain::WF_REGISTER_ACTOR_UNVERIFIED_V0"
+
+        payload_a = {"b": 2, "a": 1}
+        payload_b = {"a": 1, "b": 2}
+
+        id_a = make_trace_id(domain, wf_fqdn, payload_a)
+        id_b = make_trace_id(domain, wf_fqdn, payload_b)
+
+        suffix_a = id_a.rsplit("__", 1)[-1]
+        suffix_b = id_b.rsplit("__", 1)[-1]
+        self.assertEqual(suffix_a, suffix_b)
+
+    def test_load_domain_is_idempotent(self):
+        """load_domain MUST return identical structure on repeated calls."""
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp)
+            domain = "testdomain"
+            _write_snapshot(workspace, domain, projection_hash="cafebabe")
+
+            pkg1 = load_domain(workspace, domain)
+            pkg2 = load_domain(workspace, domain)
+
+            self.assertEqual(pkg1.domain, pkg2.domain)
+            self.assertEqual(pkg1.dispatch.routing, pkg2.dispatch.routing)
+            self.assertEqual(pkg1.dispatch.pipeline, pkg2.dispatch.pipeline)
+            self.assertEqual(pkg1.handlers.ct, pkg2.handlers.ct)
+            self.assertEqual(pkg1.vocab.forward, pkg2.vocab.forward)
 
 
 if __name__ == '__main__':

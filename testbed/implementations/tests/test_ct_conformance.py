@@ -7,7 +7,7 @@ CT handler_ref binding is compile-time sealed — no runtime registry.
 
 import unittest
 
-from omnibachi.implementation.execution.machine.transforms.ct_executor import CTExecutor, CTExecutionError
+from pgs_runtime.ct_executor import CTExecutor, CTExecutionError
 
 
 # ── Minimal atom functions used as handler_ref targets ──────────────

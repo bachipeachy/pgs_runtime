@@ -12,9 +12,37 @@ Uses standard Python unittest framework (no external dependencies).
 import sys
 import unittest
 import os
+from pathlib import Path
+
+
+def _inject_workspace_env() -> None:
+    """
+    Auto-populate PGS_WORKSPACE and PGS_DATA_ROOT from the standard sibling
+    layout if the caller has not set them. This allows integration tests to run
+    without manual env-var setup when pgs_workspace is a sibling of pgs_runtime.
+
+    Layout assumed:
+        <base>/pgs_runtime/   ← this repo
+        <base>/pgs_workspace/ ← compiled workspace (sibling)
+    """
+    if os.environ.get("PGS_WORKSPACE"):
+        return  # already set by caller — respect it
+
+    runtime_root = Path(__file__).resolve().parent.parent  # pgs_runtime/
+    workspace = runtime_root.parent / "pgs_workspace"
+
+    if not workspace.is_dir():
+        return  # sibling workspace not found — tests will skip as before
+
+    os.environ["PGS_WORKSPACE"] = str(workspace)
+
+    if not os.environ.get("PGS_DATA_ROOT"):
+        os.environ["PGS_DATA_ROOT"] = str(workspace / "data")
+
 
 def run_tests(verbosity=2):
     """Run all runtime tests."""
+    _inject_workspace_env()
     loader = unittest.TestLoader()
     
     # Get the directory where this script is located
